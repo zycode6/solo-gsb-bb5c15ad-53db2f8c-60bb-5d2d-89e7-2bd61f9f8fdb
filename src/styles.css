@@ -809,3 +809,172 @@ body {
   gap: 8px;
   flex-shrink: 0;
 }
+
+/* ---------- 双语字幕合并 ---------- */
+.merge-section {
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 14px 16px 16px;
+  margin-bottom: 14px;
+}
+
+.merge-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.merge-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+}
+
+.merge-icon {
+  font-size: 17px;
+}
+
+.merge-file {
+  color: var(--text-dim);
+  font-size: 12.5px;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-head-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.merge-rules {
+  margin: 8px 0 12px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.merge-blocked {
+  margin: 0 0 12px;
+}
+
+.merge-error {
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.merge-table-wrap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: auto;
+  max-height: 38vh;
+  margin-bottom: 14px;
+}
+
+.merge-table .pl-no {
+  width: 44px;
+  color: var(--text-faint);
+  text-align: right;
+}
+
+.merge-table .pl-score {
+  width: 150px;
+  white-space: nowrap;
+}
+
+.merge-delta {
+  margin-left: 8px;
+  color: var(--warn);
+  font-size: 11.5px;
+}
+
+.merge-table .pl-text {
+  max-width: 300px;
+  min-width: 140px;
+}
+
+.merge-table .cue-text {
+  font-size: 12px;
+  max-height: 72px;
+  overflow: hidden;
+}
+
+.merge-unmatched {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.merge-col-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.merge-col-hint {
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--ok);
+}
+
+.merge-hint-warn {
+  color: var(--warn);
+}
+
+.merge-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.merge-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(42, 53, 80, 0.6);
+  font-size: 12.5px;
+}
+
+.merge-list li:last-child {
+  border-bottom: none;
+}
+
+.merge-list-time {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+
+.merge-list-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-list-empty {
+  color: var(--text-faint) !important;
+  justify-content: center;
+}
+
+@media (max-width: 900px) {
+  .merge-unmatched {
+    grid-template-columns: 1fr;
+  }
+}

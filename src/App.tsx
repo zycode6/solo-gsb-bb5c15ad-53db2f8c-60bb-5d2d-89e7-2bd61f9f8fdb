@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import CueTable, { type FilterMode } from './components/CueTable'
+import MergePanel from './components/MergePanel'
 import PlanImportDialog from './components/PlanImportDialog'
 import VideoPreview from './components/VideoPreview'
 import { buildSrt, type Cue, parseSrt } from './lib/srt'
@@ -13,6 +14,7 @@ import {
 import { activeLines, seekTargetSec } from './lib/sync'
 import { formatTime, parseTime } from './lib/time'
 import { parsePlan, previewPlan, serializePlan, type PlanPreview } from './lib/plan'
+import { buildMergedSrt, computeMergePlan, type MergePlan } from './lib/merge'
 import { SAMPLE_SRT } from './sample'
 
 interface Notice {
@@ -33,9 +35,12 @@ export default function App() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [videoName, setVideoName] = useState('')
   const [playMs, setPlayMs] = useState(0)
+  const [secCues, setSecCues] = useState<Cue[] | null>(null)
+  const [secFileName, setSecFileName] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
   const planFileRef = useRef<HTMLInputElement>(null)
   const videoFileRef = useRef<HTMLInputElement>(null)
+  const secFileRef = useRef<HTMLInputElement>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   /** 当前持有的视频对象 URL，用于在替换 / 卸载 / 组件卸载时精确释放。 */
   const videoUrlRef = useRef<string | null>(null)
@@ -54,6 +59,21 @@ export default function App() {
     return set.size
   }, [issues])
   const hasErrors = errorCount > 0
+
+  /**
+   * 双语合并匹配：锚点（lines）或次轨任一变化都立即重算；
+   * 规模过大等异常情况下返回错误信息，不再给出预览。
+   */
+  const mergeResult: { plan: MergePlan | null; error: string | null } = useMemo(() => {
+    if (!secCues) return { plan: null, error: null }
+    try {
+      return { plan: computeMergePlan(lines, secCues), error: null }
+    } catch (e) {
+      return { plan: null, error: e instanceof Error ? e.message : '匹配计算失败。' }
+    }
+  }, [lines, secCues])
+  const mergePlan = mergeResult.plan
+  const mergeError = mergeResult.error
 
   const flash = useCallback((n: Notice) => {
     setNotice(n)
@@ -138,6 +158,9 @@ export default function App() {
       setFilter('all')
       setPlanPreview(null)
       setPlanFileName('')
+      // 主轨已整体替换，次轨不再适用
+      setSecCues(null)
+      setSecFileName('')
       // 保留已载入的视频，但重置播放位置
       const video = videoRef.current
       if (video) {
@@ -275,6 +298,72 @@ export default function App() {
     URL.revokeObjectURL(url)
     flash({ level: 'info', text: '已导出校准后的 SRT 文件（序号与文本保持不变）。' })
   }, [cues, lines, fileName, hasErrors, errorCount, flash])
+
+  /** 导入第二份 SRT（次轨），用于双语合并；匹配预览随锚点实时重算。 */
+  const loadSecSrt = useCallback(
+    (content: string, name: string) => {
+      const { cues: parsed, skipped } = parseSrt(content)
+      if (parsed.length === 0) {
+        flash({ level: 'error', text: '未能从次轨文件中解析出任何有效的 SRT 字幕。' })
+        return
+      }
+      setSecCues(parsed)
+      setSecFileName(name)
+      flash({
+        level: 'info',
+        text:
+          `已导入次轨「${name}」共 ${parsed.length} 条字幕，正在按校准后的主时间轴匹配。` +
+          (skipped > 0 ? `（${skipped} 个无法解析的块已跳过）` : ''),
+      })
+    },
+    [flash],
+  )
+
+  const onSecFile = useCallback(
+    (file: File) => {
+      const reader = new FileReader()
+      reader.onload = () => loadSecSrt(String(reader.result ?? ''), file.name)
+      reader.onerror = () => flash({ level: 'error', text: '读取次轨文件失败。' })
+      reader.readAsText(file)
+    },
+    [flash, loadSecSrt],
+  )
+
+  const unloadSec = useCallback(() => {
+    setSecCues(null)
+    setSecFileName('')
+    flash({ level: 'info', text: '已移除次轨，恢复仅主轨视图。' })
+  }, [flash])
+
+  /**
+   * 导出双语 SRT：主轨时间码与主文本 + 已匹配次轨文本（追加为下一行）。
+   * 主轨存在任意校验错误时禁止合并导出。
+   */
+  const exportMergedSrt = useCallback(() => {
+    if (!cues || !secCues || !mergePlan) return
+    if (hasErrors) {
+      flash({ level: 'error', text: `主轨仍有 ${errorCount} 条字幕存在错误，解决后才能合并导出。` })
+      return
+    }
+    const payload = buildMergedSrt(lines, secCues, mergePlan)
+    const blob = new Blob([payload], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const base = fileName.replace(/\.srt$/i, '') || 'subtitles'
+    a.href = url
+    a.download = `${base}.bilingual.srt`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    flash({
+      level: 'info',
+      text:
+        `已导出双语 SRT：${mergePlan.edges.length} 条合并了次轨文本，` +
+        `${mergePlan.unmatchedMain.length} 条未匹配主轨照常导出，` +
+        `次轨 ${mergePlan.unmatchedSecondary.length} 条未匹配项未写入。`,
+    })
+  }, [cues, secCues, mergePlan, lines, fileName, hasErrors, errorCount, flash])
 
   const downloadFile = useCallback((content: string, downloadName: string, mime: string) => {
     const blob = new Blob([content], { type: mime })
@@ -449,6 +538,29 @@ export default function App() {
           >
             导入锚点方案
           </button>
+          <input
+            ref={secFileRef}
+            type="file"
+            accept=".srt,text/plain"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0]
+              if (f) onSecFile(f)
+              e.target.value = ''
+            }}
+          />
+          <button
+            className="btn"
+            disabled={!cues}
+            onClick={() => secFileRef.current?.click()}
+            title={
+              cues
+                ? '在主轨校准完成后导入第二份 SRT，按校准后时间轴做一对一匹配并导出双语字幕'
+                : '请先导入并校准主 SRT'
+            }
+          >
+            {secCues ? '替换次轨 SRT' : '导入次轨 SRT（双语合并）'}
+          </button>
           <button className="btn btn-danger-outline" disabled={!cues || hasErrors} onClick={exportSrt}>
             导出新 SRT
           </button>
@@ -528,6 +640,27 @@ export default function App() {
               </div>
             )}
           </section>
+          {secCues &&
+            (mergePlan ? (
+              <MergePanel
+                lines={lines}
+                secCues={secCues}
+                secFileName={secFileName}
+                plan={mergePlan}
+                hasErrors={hasErrors}
+                errorCount={errorCount}
+                onReplaceSec={() => secFileRef.current?.click()}
+                onUnloadSec={unloadSec}
+                onExportMerged={exportMergedSrt}
+              />
+            ) : (
+              <div className="export-blocked merge-error">
+                {mergeError ?? '匹配计算失败。'}
+                <button className="btn btn-small" onClick={unloadSec}>
+                  移除次轨
+                </button>
+              </div>
+            ))}
           <CueTable
             lines={lines}
             anchors={anchors}

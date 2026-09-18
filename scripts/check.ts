@@ -9,6 +9,7 @@ import {
   serializePlan,
   type AnchorPlan,
 } from '../src/lib/plan'
+import { buildMergedSrt, computeMergePlan, legalEdge } from '../src/lib/merge'
 import { SAMPLE_SRT } from '../src/sample'
 
 let failures = 0
@@ -430,6 +431,324 @@ if ('plan' in e2ePlanRes) {
     e2ePreview.anchors?.[0].source === cues[0].start && e2ePreview.anchors[0].target === 3000,
     '端到端锚点值一致',
   )
+}
+
+// ---- 双语字幕合并 ----
+console.log('双语合并：候选合法性')
+assert(
+  legalEdge({ start: 0, end: 4000 }, { start: 2000, end: 6000 })?.overlap === 2000,
+  '正重叠返回重叠时长',
+)
+assert(
+  legalEdge({ start: 0, end: 4000 }, { start: 2000, end: 6000 })?.startDelta === 2000,
+  '起始时间差为绝对值',
+)
+assert(
+  legalEdge({ start: 0, end: 4000 }, { start: 4000, end: 8000 }) === null,
+  '仅端点相接（无正重叠）不合法',
+)
+assert(
+  legalEdge({ start: 0, end: 4000 }, { start: 10000, end: 12000 }) === null,
+  '完全不重叠不合法',
+)
+// 重叠 1900，较短者 4000，50% 为 2000 → 不合法
+assert(
+  legalEdge({ start: 0, end: 4000 }, { start: 2100, end: 6000 }) === null,
+  '重叠不足较短字幕 50% 不合法',
+)
+// 重叠恰好 2000 = 4000 的 50% → 合法（“不少于”含边界）
+assert(
+  legalEdge({ start: 0, end: 4000 }, { start: 2000, end: 6000 }) !== null,
+  '重叠恰好达到 50% 合法',
+)
+// 较短者是次轨：主 10s、次 2s，次轨全包含时重叠 2s 合法
+assert(
+  legalEdge({ start: 0, end: 10000 }, { start: 0, end: 2000 })?.overlap === 2000,
+  '较短者为次轨：全包含 2s 合法',
+)
+assert(
+  legalEdge({ start: 0, end: 10000 }, { start: 1000, end: 3000 })?.overlap === 2000,
+  '较短者为次轨 2s、重叠 2s 全包含合法',
+)
+// 较短者为次轨 2s（[1000,3000]），重叠 900 < 1000（次轨半长）→ 不合法
+assert(
+  legalEdge({ start: 0, end: 1900 }, { start: 1000, end: 3000 }) === null,
+  '较短者为次轨 2s、重叠 900 不足次轨 50% 不合法',
+)
+// 较短者是主轨：主 1s、次 10s，重叠恰 500ms = 主轨半长 → 合法
+assert(
+  legalEdge({ start: 1000, end: 2000 }, { start: 0, end: 10000 }) !== null,
+  '较短者为主轨：重叠恰为 50% 合法',
+)
+// 较短者是主轨 1s（[600,1600]），与次轨 [0,1000] 重叠 400 < 500 → 不合法
+assert(
+  legalEdge({ start: 600, end: 1600 }, { start: 0, end: 1000 }) === null,
+  '较短者为主轨：重叠不足主轨 50% 不合法',
+)
+assert(legalEdge({ start: 0, end: 0 }, { start: 0, end: 2000 }) === null, '主轨零时长不合法')
+assert(legalEdge({ start: 2000, end: 1000 }, { start: 0, end: 2000 }) === null, '主轨负时长不合法')
+assert(legalEdge({ start: 0, end: 2000 }, { start: 2000, end: 2000 }) === null, '次轨零时长不合法')
+
+/** 构造校准后主轨行（newStart/newEnd 即校准后区间，原始字段供其他逻辑使用）。 */
+const mkMain = (index: number, start: number, end: number, text: string): MappedLine => ({
+  index,
+  id: String(index + 1),
+  start,
+  end,
+  text,
+  newStart: start,
+  newEnd: end,
+})
+const mkSec = (index: number, start: number, end: number, text: string): Cue => ({
+  index,
+  id: String(index + 1),
+  start,
+  end,
+  text,
+})
+const edgePair = (plan: { edges: Array<{ mainIndex: number; secIndex: number }> }) =>
+  plan.edges.map((e) => `${e.mainIndex}-${e.secIndex}`).join(',')
+
+console.log('双语合并：顺序保持一对一')
+{
+  // 主 A[0,4] B[5,9]；次 X[0,4] Y[5,9]：完全对齐
+  const main = [mkMain(0, 0, 4000, 'A'), mkMain(1, 5000, 9000, 'B')]
+  const sec = [mkSec(0, 0, 4000, 'X'), mkSec(1, 5000, 9000, 'Y')]
+  const p = computeMergePlan(main, sec)
+  assert(p.edges.length === 2 && edgePair(p) === '0-0,1-1', '完全对齐：逐对匹配')
+  assert(p.totalOverlap === 8000 && p.totalStartDelta === 0, '总重叠 8s、时差 0')
+  assert(p.unmatchedMain.length === 0 && p.unmatchedSecondary.length === 0, '无未匹配项')
+}
+
+{
+  // 交叉的一对一：主 A[0,4] B[5,9]；次 X 与 B 对齐、Y 与 A 对齐（时间不交叉）
+  const main = [mkMain(0, 0, 4000, 'A'), mkMain(1, 5000, 9000, 'B')]
+  const sec = [mkSec(0, 0, 4000, 'Y'), mkSec(1, 5000, 9000, 'X')]
+  const p = computeMergePlan(main, sec)
+  // 次轨按时间排列，仍然 0-0 / 1-1（匹配只看时间与顺序，与文本无关）
+  assert(edgePair(p) === '0-0,1-1', '匹配基于时间轴顺序，与文本内容无关')
+}
+
+console.log('双语合并：最大化总重叠优先')
+{
+  // 主 A[0,4] B[4,8]；次 X[0,6] Y[6,8]
+  // A-X ov4/d2, A-Y 不重叠; B-X ov2/d2, B-Y ov2/d2
+  // (A-X,B-Y): ov=4+2=6；(A-X,B-X) 不可能（X 已用）；跳过 X：(B-Y) ov2；
+  // 另：A-X(4)+B? B-Y(2)=6；A-X + B 无其他 → 6 为最优
+  const main = [mkMain(0, 0, 4000, 'A'), mkMain(1, 4000, 8000, 'B')]
+  const sec = [mkSec(0, 0, 6000, 'X'), mkSec(1, 6000, 8000, 'Y')]
+  const p = computeMergePlan(main, sec)
+  assert(p.totalOverlap === 6000, '总重叠最大化 = 6s')
+  assert(edgePair(p) === '0-0,1-1', '两对都匹配')
+}
+
+{
+  // 一对多的重叠权衡：主 A[0,10]；次 X[0,6] Y[4,10]
+  // A-X ov6（6>=5 较短6的50%=3 ✓）；A-Y ov6；只能选一条（一对一，次序不可交叉）
+  const main = [mkMain(0, 0, 10000, 'A')]
+  const sec = [mkSec(0, 0, 6000, 'X'), mkSec(1, 4000, 10000, 'Y')]
+  const p = computeMergePlan(main, sec)
+  assert(p.edges.length === 1, '一对一：只能匹配一条次轨')
+  assert(p.edges[0].secIndex === 0, '总重叠并列（6s）→ 时差更小（0 < 4000）选 X')
+  assert(p.unmatchedSecondary.length === 1 && p.unmatchedSecondary[0] === 1, '另一条次轨列为未匹配')
+}
+
+{
+  // 多对一的重叠权衡：主 A[0,6] B[4,10]；次 X[0,10]
+  // A-X ov6, B-X ov6，只能匹配一条主轨
+  const main = [mkMain(0, 0, 6000, 'A'), mkMain(1, 4000, 10000, 'B')]
+  const sec = [mkSec(0, 0, 10000, 'X')]
+  const p = computeMergePlan(main, sec)
+  assert(p.edges.length === 1 && p.edges[0].mainIndex === 0, '并列时主序靠前的 A 匹配（次序号序列同为 [0]）')
+  assert(p.unmatchedMain.length === 1 && p.unmatchedMain[0] === 1, '另一条主轨列为未匹配')
+}
+
+{
+  // 次序号字典序：次 X[0,3] Y[3,6] 都只与主 A[0,6] 合法，重叠/时差均相同 → 取 X
+  const main = [mkMain(0, 0, 6000, 'A')]
+  const sec = [mkSec(0, 0, 3000, 'X'), mkSec(1, 3000, 6000, 'Y')]
+  const p = computeMergePlan(main, sec)
+  assert(p.edges[0].secIndex === 0, '完全并列选择次轨序号字典序更早的 X')
+}
+
+console.log('双语合并：起始时间差总和为次级目标')
+{
+  // 主 A[0,8] B[8,12]；次 X[0,6] Y[6,12]
+  // 候选：A-X ov6 d0（较短6，半长3 ✓）；A-Y ov2（较短4半长2 ✓，恰50%）d8
+  //       B-X ov2（较短6半长3，ov2<3 非法）；B-Y ov4 d2
+  // 方案1 A-X+B-Y: ov10 d2；方案2 A-Y: ov2 d8；方案1 优
+  const main = [mkMain(0, 0, 8000, 'A'), mkMain(1, 8000, 12000, 'B')]
+  const sec = [mkSec(0, 0, 6000, 'X'), mkSec(1, 6000, 12000, 'Y')]
+  const p = computeMergePlan(main, sec)
+  assert(edgePair(p) === '0-0,1-1' && p.totalOverlap === 10000, '高重叠组合胜出')
+  assert(p.totalStartDelta === 2000, '时差合计 2s')
+}
+
+{
+  // 总重叠相同、时差不同：主 A[0,6] B[6,10]；次 X[1,5] Y[5,9]
+  // A-X ov4 d1（较短4半长2 ✓），A-Y ov1（较短4半长2，1<2 非法）
+  // B-X ov1（较短4半长2，非法），B-Y ov4 d1
+  // 只能 A-X + B-Y（唯一合法组合）；补充一个纯时差并列场景见下
+  const main = [mkMain(0, 0, 6000, 'A'), mkMain(1, 6000, 10000, 'B')]
+  const sec = [mkSec(0, 1000, 5000, 'X'), mkSec(1, 5000, 9000, 'Y')]
+  const p = computeMergePlan(main, sec)
+  assert(edgePair(p) === '0-0,1-1' && p.totalStartDelta === 2000, '交叉不合法时按顺序匹配')
+}
+
+{
+  // 纯时差裁决（总重叠相同）：主 A[0,4]；次 X[0,4]（d0）Y[1,5]（ov3 合法 d1）
+  const main = [mkMain(0, 0, 4000, 'A')]
+  const sec = [mkSec(0, 0, 4000, 'X'), mkSec(1, 1000, 5000, 'Y')]
+  const p = computeMergePlan(main, sec)
+  // A-X ov4 d0；A-Y ov3 d1 → 重叠不同，X 胜（验证重叠优先）
+  assert(p.edges[0].secIndex === 0 && p.edges[0].overlap === 4000, '重叠优先于时差')
+}
+
+console.log('双语合并：未匹配清单')
+{
+  const main = [mkMain(0, 0, 4000, 'A'), mkMain(1, 100000, 104000, 'B')]
+  const sec = [mkSec(0, 0, 4000, 'X'), mkSec(1, 200000, 204000, 'Y')]
+  const p = computeMergePlan(main, sec)
+  assert(edgePair(p) === '0-0', '只匹配时间重合的一对')
+  assert(
+    p.unmatchedMain.length === 1 &&
+      p.unmatchedSecondary.length === 1 &&
+      p.unmatchedMain[0] === 1 &&
+      p.unmatchedSecondary[0] === 1,
+    '双方未匹配条目分别列出',
+  )
+}
+
+console.log('双语合并：导出沿用主轨时间码，次轨文本追加为下一行')
+{
+  const main = [
+    mkMain(0, 0, 4000, '主文本一'),
+    mkMain(1, 5000, 9000, '主文本二'),
+    mkMain(2, 10000, 14000, '主文本三'),
+  ]
+  const sec = [mkSec(0, 0, 4000, 'SEC-ONE'), mkSec(1, 5000, 9000, 'SEC-TWO')]
+  const p = computeMergePlan(main, sec)
+  const out = buildMergedSrt(main, sec, p)
+  const blocks = out.trim().split('\n\n')
+  assert(blocks.length === 3, '导出条目数等于主轨条数')
+  assert(
+    blocks[0] === '1\n00:00:00,000 --> 00:00:04,000\n主文本一\nSEC-ONE',
+    '已匹配：主文本 + 次轨文本追加为下一行，沿用主时间码与序号',
+  )
+  assert(
+    blocks[1] === '2\n00:00:05,000 --> 00:00:09,000\n主文本二\nSEC-TWO',
+    '第二条同样合并',
+  )
+  assert(blocks[2] === '3\n00:00:10,000 --> 00:00:14,000\n主文本三', '未匹配主轨照常导出且不追加')
+  assert(!out.includes('SEC-') || (out.match(/SEC-/g) ?? []).length === 2, '次轨文本仅在匹配处出现')
+
+  // 往返：再解析仍是 3 条
+  const reparsed = parseSrt(out)
+  assert(reparsed.cues.length === 3, '合并导出可被重新解析为 3 条')
+  assert(
+    reparsed.cues[0].text === '主文本一\nSEC-ONE',
+    '合并文本（多行）在往返后保持',
+  )
+}
+
+{
+  // 小数毫秒的校准结果导出时四舍五入为合法时间码
+  const main = [mkMain(0, 0, 1, 'A')]
+  const sec = [mkSec(0, 0, 1, 'X')]
+  main[0].newStart = 0.4
+  main[0].newEnd = 1.6
+  const p = computeMergePlan(main, sec)
+  const out = buildMergedSrt(main, sec, p)
+  assert(
+    out.includes('00:00:00,000 --> 00:00:00,002'),
+    '校准后的小数毫秒四舍五入后写入时间码',
+  )
+}
+
+{
+  // 次轨含多行文本：整块原样追加
+  const main = [mkMain(0, 0, 4000, '主')]
+  const sec = [mkSec(0, 0, 4000, '行1\n行2')]
+  const p = computeMergePlan(main, sec)
+  const out = buildMergedSrt(main, sec, p)
+  assert(out.includes('主\n行1\n行2'), '次轨多行文本原样追加')
+}
+
+{
+  // 规模上限保护：构造超过状态数上限的输入应抛出
+  const bigMain = Array.from({ length: 4000 }, (_, i) => mkMain(i, i * 10, i * 10 + 5, 'M'))
+  const bigSec = Array.from({ length: 4000 }, (_, i) => mkSec(i, i * 10, i * 10 + 5, 'S'))
+  let threw = false
+  try {
+    computeMergePlan(bigMain, bigSec)
+  } catch {
+    threw = true
+  }
+  assert(threw, '状态数超过上限时抛出错误（由界面提示）')
+}
+
+console.log('双语合并：确定性小规模穷举对拍（最优重叠/时差/次序号字典序）')
+{
+  // 确定性 LCG，保证检查可复现
+  let seed = 987654321
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+    return seed / 0x7fffffff
+  }
+  const ri = (lo: number, hi: number) => lo + Math.floor(rnd() * (hi - lo + 1))
+  const lexLess = (a: number[], b: number[]): boolean => {
+    for (let k = 0; k < Math.min(a.length, b.length); k++) {
+      if (a[k] !== b[k]) return a[k] < b[k]
+    }
+    return a.length < b.length
+  }
+  /** 穷举全部顺序保持的匹配方案，返回与 computeMergePlan 同一优先级下的最优解。 */
+  const brute = (ml: MappedLine[], sl: Cue[]) => {
+    let best: { ov: number; df: number; seq: number[] } | null = null
+    const rec = (i: number, j: number, ov: number, df: number, seq: number[]) => {
+      if (i === ml.length || j === sl.length) {
+        if (!best || ov > best.ov || (ov === best.ov && (df < best.df || (df === best.df && lexLess(seq, best.seq))))) {
+          best = { ov, df, seq: [...seq] }
+        }
+        return
+      }
+      rec(i + 1, j, ov, df, seq)
+      rec(i, j + 1, ov, df, seq)
+      const leg = legalEdge(ml[i], sl[j])
+      if (leg) rec(i + 1, j + 1, ov + leg.overlap, df + leg.startDelta, [...seq, j])
+    }
+    rec(0, 0, 0, 0, [])
+    return best!
+  }
+  const track = (n: number, asMain: boolean) => {
+    const arr: Array<MappedLine | Cue> = []
+    let t = 0
+    for (let i = 0; i < n; i++) {
+      t += ri(0, 2500)
+      const dur = ri(500, 4000)
+      arr.push(asMain ? mkMain(i, t, t + dur, 'M') : mkSec(i, t, t + dur, 'S'))
+      t += dur
+      if (rnd() < 0.08) t += ri(0, 40000)
+    }
+    return arr
+  }
+  let fuzzFail = 0
+  for (let trial = 0; trial < 400; trial++) {
+    const ml = track(ri(1, 7), true) as MappedLine[]
+    const sl = track(ri(1, 7), false) as Cue[]
+    const plan = computeMergePlan(ml, sl)
+    const b = brute(ml, sl)
+    const seq = plan.edges.map((e) => e.secIndex)
+    if (
+      plan.totalOverlap !== b.ov ||
+      plan.totalStartDelta !== b.df ||
+      seq.length !== b.seq.length ||
+      seq.some((v, k) => v !== b.seq[k])
+    ) {
+      fuzzFail++
+    }
+  }
+  assert(fuzzFail === 0, `400 组随机输入与穷举最优解完全一致（偏差组数 ${fuzzFail}）`)
 }
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 项失败 ❌`)

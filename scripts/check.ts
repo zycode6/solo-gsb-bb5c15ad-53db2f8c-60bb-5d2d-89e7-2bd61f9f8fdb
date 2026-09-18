@@ -9,7 +9,8 @@ import {
   serializePlan,
   type AnchorPlan,
 } from '../src/lib/plan'
-import { SAMPLE_SRT } from '../src/sample'
+import { buildMergedSrt, legalPair, mergeSubtitles } from '../src/lib/merge'
+import { SAMPLE_SRT, SAMPLE_SECONDARY_SRT } from '../src/sample'
 
 let failures = 0
 const assert = (cond: boolean, msg: string) => {
@@ -70,6 +71,7 @@ assert(cues[0].text.startsWith('欢迎使用'), '文本正确')
 
 const crlf = parseSrt('1\r\n00:00:01,000 --> 00:00:02,000\r\nhi\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\nbye')
 assert(crlf.cues.length === 2, 'CRLF 解析')
+assert(parseSrt(SAMPLE_SECONDARY_SRT).cues.length === 7, '示例次轨解析出 7 条')
 const dot = parseSrt('1\n00:00:01.500 --> 00:00:02.000\nx')
 assert(dot.cues.length === 1 && dot.cues[0].start === 1500, '点号毫秒解析')
 const bad = parseSrt('1\nnot a timing\nx\n\n2\n00:00:01,000 --> 00:00:02,000\ny')
@@ -430,6 +432,297 @@ if ('plan' in e2ePlanRes) {
     e2ePreview.anchors?.[0].source === cues[0].start && e2ePreview.anchors[0].target === 3000,
     '端到端锚点值一致',
   )
+}
+
+// ---- 双语字幕合并 ----
+console.log('双语合并：候选判定（正重叠且 ≥ 较短字幕 50%）')
+const mkMain = (index: number, s: number, e: number, text = `主${index + 1}`): MappedLine => ({
+  index,
+  id: String(index + 1),
+  start: s,
+  end: e,
+  text,
+  newStart: s,
+  newEnd: e,
+})
+const mkSec = (index: number, s: number, e: number, text = `次${index + 1}`): Cue => ({
+  index,
+  id: String(index + 1),
+  start: s,
+  end: e,
+  text,
+})
+const pairKey = (res: ReturnType<typeof mergeSubtitles>) =>
+  res.pairs.map((p) => `${p.mainIndex}:${p.secondaryIndex}`).join(',')
+
+// 重叠 600ms，较短字幕 1000ms → 60% 合法；起始差 100
+assert(
+  legalPair(mkMain(0, 1000, 2000), mkSec(0, 1100, 1700))?.overlapMs === 600,
+  '正重叠 ≥50% 判定为候选',
+)
+// 重叠 400ms = 较短字幕（1000ms）的 40% → 不合法（次轨延到 2600，重叠为 1600..2000）
+assert(
+  legalPair(mkMain(0, 1000, 2000), mkSec(0, 1600, 2600)) === null,
+  '重叠不足较短字幕 50% 不是候选',
+)
+// 恰好 50%（较短 1000ms，重叠 500ms）→ 合法（“不少于”含边界）
+assert(
+  legalPair(mkMain(0, 1000, 2000), mkSec(0, 1500, 3000)) !== null,
+  '重叠恰好 50% 仍为候选',
+)
+// 仅端点相接（重叠 0）→ 不合法
+assert(legalPair(mkMain(0, 1000, 2000), mkSec(0, 2000, 3000)) === null, '无正重叠（端点相接）不是候选')
+// 较短的一侧是主轨：主 500ms、次 1000ms，重叠 300ms = 60% 主时长 → 合法
+assert(
+  legalPair(mkMain(0, 1000, 1500), mkSec(0, 900, 1900)) !== null,
+  '较短字幕为主轨时按主轨时长的 50% 判定',
+)
+// 校准后时长非正的主轨不参与
+assert(legalPair(mkMain(0, 2000, 2000), mkSec(0, 1900, 2100)) === null, '非正时长主轨不参与匹配')
+
+console.log('双语合并：基础一对一与未匹配条目')
+{
+  const mains = [mkMain(0, 1000, 3000), mkMain(1, 5000, 7000), mkMain(2, 9000, 11000)]
+  const secs = [
+    mkSec(0, 1100, 2900),
+    mkSec(1, 5200, 6900),
+    mkSec(2, 9100, 10900),
+    mkSec(3, 20000, 22000), // 无任何重叠 → 未匹配次轨
+  ]
+  const r = mergeSubtitles(mains, secs)
+  assert(r.pairs.length === 3, '三对一一匹配')
+  assert(pairKey(r) === '0:0,1:1,2:2', '按文件顺序成对')
+  assert(r.unmatchedMain.length === 0, '主轨全部匹配')
+  assert(r.unmatchedSecondary.length === 1 && r.unmatchedSecondary[0] === 3, '无重叠次轨列入未匹配')
+  assert(r.totalOverlapMs === 1800 + 1700 + 1800, '总重叠毫秒数正确')
+  assert(r.totalStartDeltaMs === 100 + 200 + 100, '起始时间差总和正确')
+}
+
+console.log('双语合并：不足阈值的条目双方均不匹配')
+{
+  // 主 [1000,2000]，次 [1600,2600] 仅 400ms 重叠（较短 1000ms 的 40%）；双方都应为未匹配
+  const r = mergeSubtitles([mkMain(0, 1000, 2000)], [mkSec(0, 1600, 2600)])
+  assert(r.pairs.length === 0, '不足 50% 不产生匹配')
+  assert(r.unmatchedMain[0] === 0 && r.unmatchedSecondary[0] === 0, '双方各自列入未匹配')
+  assert(r.totalOverlapMs === 0 && r.totalStartDeltaMs === 0, '空方案得分为 0')
+}
+
+console.log('双语合并：顺序保持——交叉方案总重叠更高也不采用')
+{
+  // 构造“交叉成对也合法”的场景：两条主轨时间高度重叠（异常输入也必须按规则裁决）。
+  // A[0,10000]、B[1000,11000]；X[1100,11000]、Y[0,10000]
+  // 四个交叉对全部满足“重叠 ≥ 较短字幕 50%”：
+  //   0:0 重叠 8900、1:1 重叠 9000 → 顺序方案总重叠 17900
+  //   0:1 重叠 10000、1:0 重叠 9900 → 交叉方案总重叠 19900（更高，但破坏双方顺序）
+  const mains = [mkMain(0, 0, 10000), mkMain(1, 1000, 11000)]
+  const secs = [mkSec(0, 1100, 11000), mkSec(1, 0, 10000)]
+  const r = mergeSubtitles(mains, secs)
+  assert(pairKey(r) === '0:0,1:1', '即使交叉成对总重叠更高，也必须保持双方顺序')
+  assert(r.totalOverlapMs === 17900, '总重叠按顺序方案计算（拒绝交叉方案）')
+}
+
+console.log('双语合并：平局裁决 1——总重叠相同时最小化起始差之和')
+{
+  // 单主轨即可制造“两个合法候选总重叠相同、起始差不同”：
+  // A[0,1000]；X[100,1100]（重叠 900，delta 100）、Z[0,1000]（重叠 1000，delta 0）
+  // 为使总重叠并列，再让 X 重叠 900、Z 也 900：Z 取 [0,900]（delta 0）。
+  // 次序：0=X(delta100) 1=Z(delta0)，两者与 A 重叠均为 900，均 ≥500。
+  const mains = [mkMain(0, 0, 1000)]
+  const secs = [mkSec(0, 100, 1100), mkSec(1, 0, 900)]
+  const r = mergeSubtitles(mains, secs)
+  assert(
+    pairKey(r) === '0:1' && r.totalOverlapMs === 900 && r.totalStartDeltaMs === 0,
+    '总重叠并列时选择起始差更小的候选（Z，delta 0）',
+  )
+}
+
+console.log('双语合并：平局裁决 2——起始差仍并列时次轨序号字典序更早')
+{
+  // A[0,1000]；次 0=P[0,1000]、次 1=Q[0,1000] 几何完全等价（重叠与 delta 相同）。
+  const mains = [mkMain(0, 0, 1000)]
+  const secs = [mkSec(0, 0, 1000), mkSec(1, 0, 1000)]
+  const r = mergeSubtitles(mains, secs)
+  assert(pairKey(r) === '0:0', '次轨序号字典序更早者（#1）胜')
+  assert(r.unmatchedSecondary[0] === 1, '未选择的等位次轨（#2）列为未匹配')
+}
+
+console.log('双语合并：单边数量不等 + 仅部分匹配')
+{
+  const mains = [mkMain(0, 1000, 2000), mkMain(1, 5000, 6000)]
+  const secs = [mkSec(0, 1000, 2000), mkSec(1, 5000, 6000), mkSec(2, 8000, 9000)]
+  const r = mergeSubtitles(mains, secs)
+  assert(r.pairs.length === 2 && r.unmatchedSecondary[0] === 2, '次轨多出的尾部不匹配')
+
+  const mains2 = [mkMain(0, 1000, 2000), mkMain(1, 5000, 6000), mkMain(2, 9000, 10000)]
+  const secs2 = [mkSec(0, 1000, 2000)]
+  const r2 = mergeSubtitles(mains2, secs2)
+  assert(
+    pairKey(r2) === '0:0' && r2.unmatchedMain.join(',') === '1,2',
+    '主轨多出的条目不匹配且按顺序列出',
+  )
+}
+
+console.log('双语合并：空输入')
+{
+  assert(mergeSubtitles([], []).pairs.length === 0, '双方为空得到空方案')
+  assert(mergeSubtitles([mkMain(0, 0, 1000)], []).unmatchedMain[0] === 0, '无次轨时主轨全部未匹配')
+}
+
+console.log('双语合并：导出沿用主轨时间码与文本，次轨文本追加为下一行')
+{
+  const mains = [
+    mkMain(0, 1000, 3000, '主文本一'),
+    mkMain(1, 5000, 7000, '主文本二\n第二行'),
+  ]
+  const secs = [
+    mkSec(0, 1200, 2900, 'Secondary one'),
+    mkSec(1, 5100, 6900, 'Secondary two\nline two'),
+  ]
+  const r = mergeSubtitles(mains, secs)
+  const srt = buildMergedSrt(mains, secs, r)
+  assert(
+    srt.includes('00:00:01,000 --> 00:00:03,000\n主文本一\nSecondary one'),
+    '已匹配主轨：主时间码 + 主文本 + 次轨文本下一行',
+  )
+  assert(
+    srt.includes('00:00:05,000 --> 00:00:07,000\n主文本二\n第二行\nSecondary two\nline two'),
+    '多行主/次文本各自原样保留并追加',
+  )
+}
+
+console.log('双语合并：未匹配主轨照常导出，未匹配次轨不写入')
+{
+  const mains = [mkMain(0, 1000, 3000, '主一'), mkMain(1, 8000, 9000, '主二（无次轨）')]
+  const secs = [mkSec(0, 1100, 2900, '次一'), mkSec(1, 20000, 22000, '次二（无主轨）')]
+  const r = mergeSubtitles(mains, secs)
+  assert(r.pairs.length === 1, '仅一对匹配')
+  const srt = buildMergedSrt(mains, secs, r)
+  assert(srt.includes('主二（无次轨）'), '未匹配主轨文本照常导出')
+  assert(!srt.includes('次二（无主轨）'), '未匹配次轨不写入文件')
+  const rep = parseSrt(srt)
+  assert(rep.cues.length === 2, '导出去条目数等于主轨条目数（次轨不新增条目）')
+  assert(
+    rep.cues[1].text === '主二（无次轨）' && rep.cues[1].start === 8000 && rep.cues[1].end === 9000,
+    '未匹配主轨时间码与文本均沿用主轨校准结果',
+  )
+}
+
+console.log('双语合并：锚点变化（主轨时间轴重映射）后匹配实时变化')
+{
+  // 主轨原始 [11s,12s] 与次轨 [1s,2s] 完全不重叠；整体平移 -10s 后应匹配
+  const rawCues = [
+    { id: '1', index: 0, start: 11000, end: 12000, text: '主' },
+  ]
+  const before = mapCues(rawCues, [])
+  const secs = [mkSec(0, 1000, 2000, '次')]
+  assert(mergeSubtitles(before, secs).pairs.length === 0, '校准前无重叠 → 无匹配')
+  const after = mapCues(rawCues, [{ source: 11000, target: 1000 }])
+  assert(after[0].newStart === 1000, '单锚点整体平移 -10s')
+  const ra = mergeSubtitles(after, secs)
+  assert(ra.pairs.length === 1 && ra.pairs[0].secondaryIndex === 0, '校准后产生一对一匹配')
+}
+
+console.log('双语合并：端到端（示例主轨 + 同步次轨，锚点重映射）')
+{
+  const secContent = SAMPLE_SRT.replace(/欢迎使用字幕时间轴校准工具。/, 'Welcome to the SRT alignment tool.')
+  const secParsed = parseSrt(secContent).cues
+  const anchored = mapCues(cues, [
+    { source: cues[0].start, target: 3000 },
+    { source: cues[6].start, target: 60000 },
+  ])
+  // 次轨按原始时间 → 与校准后主轨不再对齐，预期匹配数下降；该检查只确保计算稳定
+  const r = mergeSubtitles(anchored, secParsed)
+  assert(r.pairs.length >= 0 && r.pairs.length <= 7, '端到端结果在合法范围内且不抛错')
+  const srt = buildMergedSrt(anchored, secParsed, r)
+  // 分段线性映射可能产生小数毫秒（与既有 buildSrt 行为一致），按空行分块计数
+  assert(srt.trim().split(/\n{2,}/).length === 7, '端到端导出块数恒等于主轨 7 条')
+  assert(!srt.includes('Welcome to the SRT alignment tool.'), '无匹配的次轨文本不会凭空写入')
+  // 无锚点（时间为整数）时整份次轨全部匹配，导出后可被严格重新解析
+  const idMapped = mapCues(cues, [])
+  const r2 = mergeSubtitles(idMapped, secParsed)
+  assert(r2.pairs.length === 7, '无锚点恒等时间轴下次轨 7 条全部匹配')
+  const rep = parseSrt(buildMergedSrt(idMapped, secParsed, r2))
+  assert(rep.cues.length === 7 && rep.skipped === 0, '整数时间码双语 SRT 可重新解析为 7 条')
+  assert(rep.cues[0].text.endsWith('Welcome to the SRT alignment tool.'), '首条主文本后追加次轨文本')
+}
+
+console.log('双语合并：随机小例对照暴力枚举（含字典序裁决）')
+{
+  /** 暴力枚举全部顺序保持的一一匹配，按同样的优先级取最优。 */
+  const EPS_LOCAL = 1e-6
+  const brute = (mains: MappedLine[], secs: Cue[]) => {
+    let best: { overlap: number; delta: number; seq: number[] } = {
+      overlap: -1,
+      delta: Infinity,
+      seq: [],
+    }
+    const rec = (i: number, j: number, seq: number[], overlap: number, delta: number) => {
+      if (i >= mains.length || j >= secs.length) {
+        const better =
+          overlap > best.overlap + EPS_LOCAL ||
+          (Math.abs(overlap - best.overlap) <= EPS_LOCAL &&
+            (delta < best.delta - EPS_LOCAL ||
+              (Math.abs(delta - best.delta) <= EPS_LOCAL && lexLess(seq, best.seq))))
+        if (better) best = { overlap, delta, seq: [...seq] }
+        return
+      }
+      rec(i + 1, j, seq, overlap, delta) // 跳过主 i
+      rec(i, j + 1, seq, overlap, delta) // 跳过次 j
+      const legal = legalPair(mains[i], secs[j])
+      if (legal) {
+        rec(i + 1, j + 1, [...seq, j], overlap + legal.overlapMs, delta + legal.startDeltaMs)
+      }
+    }
+    const lexLess = (a: number[], b: number[]): boolean => {
+      for (let k = 0; k < Math.max(a.length, b.length); k++) {
+        const x = k < a.length ? a[k] : Number.MAX_SAFE_INTEGER
+        const y = k < b.length ? b[k] : Number.MAX_SAFE_INTEGER
+        if (x !== y) return x < y
+      }
+      return false
+    }
+    rec(0, 0, [], 0, 0)
+    return best
+  }
+
+  // 固定种子的简单伪随机，保证检查可复现
+  let seed = 20260918
+  const rand = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff
+    return seed / 0x7fffffff
+  }
+  const randMain = (index: number): MappedLine => {
+    const s = Math.floor(rand() * 6000)
+    const e = s + 1 + Math.floor(rand() * 3000)
+    return mkMain(index, s, e)
+  }
+  const randSec = (index: number): Cue => {
+    const s = Math.floor(rand() * 6000)
+    const e = s + 1 + Math.floor(rand() * 3000)
+    return mkSec(index, s, e)
+  }
+
+  let trials = 0
+  let mismatches = 0
+  for (let t = 0; t < 400; t++) {
+    const mc = 1 + Math.floor(rand() * 6)
+    const nc = 1 + Math.floor(rand() * 6)
+    const mains = Array.from({ length: mc }, (_, i) => randMain(i))
+    const secs = Array.from({ length: nc }, (_, i) => randSec(i))
+    const dp = mergeSubtitles(mains, secs)
+    const bf = brute(mains, secs)
+    const dpSeq = dp.pairs.map((p) => p.secondaryIndex)
+    trials++
+    if (
+      Math.abs(dp.totalOverlapMs - bf.overlap) > EPS_LOCAL ||
+      Math.abs(dp.totalStartDeltaMs - bf.delta) > EPS_LOCAL ||
+      dpSeq.join(',') !== bf.seq.join(',')
+    ) {
+      mismatches++
+    }
+  }
+  assert(trials === 400, `完成 ${trials} 组随机小例`)
+  assert(mismatches === 0, `DP 与暴力枚举在重叠/起始差/次序号序列上完全一致（不一致 ${mismatches} 组）`)
 }
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 项失败 ❌`)

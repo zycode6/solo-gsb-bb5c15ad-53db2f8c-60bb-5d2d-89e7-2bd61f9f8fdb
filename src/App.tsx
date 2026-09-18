@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import BilingualMerge from './components/BilingualMerge'
 import CueTable, { type FilterMode } from './components/CueTable'
 import PlanImportDialog from './components/PlanImportDialog'
 import VideoPreview from './components/VideoPreview'
@@ -13,7 +14,8 @@ import {
 import { activeLines, seekTargetSec } from './lib/sync'
 import { formatTime, parseTime } from './lib/time'
 import { parsePlan, previewPlan, serializePlan, type PlanPreview } from './lib/plan'
-import { SAMPLE_SRT } from './sample'
+import { buildMergedSrt, mergeSubtitles } from './lib/merge'
+import { SAMPLE_SRT, SAMPLE_SECONDARY_SRT } from './sample'
 
 interface Notice {
   level: 'info' | 'error'
@@ -33,6 +35,9 @@ export default function App() {
   const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [videoName, setVideoName] = useState('')
   const [playMs, setPlayMs] = useState(0)
+  /** 双语合并：已导入的第二份（次轨）SRT 及其文件名。 */
+  const [secondary, setSecondary] = useState<Cue[] | null>(null)
+  const [secondaryName, setSecondaryName] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
   const planFileRef = useRef<HTMLInputElement>(null)
   const videoFileRef = useRef<HTMLInputElement>(null)
@@ -54,6 +59,16 @@ export default function App() {
     return set.size
   }, [issues])
   const hasErrors = errorCount > 0
+
+  /**
+   * 双语合并的一对一匹配：锚点变化（lines）或次轨变化时实时重算。
+   * 匹配纯按校准后主时间轴与次轨时间完成，主轨是否存在校验错误不影响预览，
+   * 只在导出环节拦截。
+   */
+  const mergeResult = useMemo(
+    () => (secondary ? mergeSubtitles(lines, secondary) : null),
+    [lines, secondary],
+  )
 
   const flash = useCallback((n: Notice) => {
     setNotice(n)
@@ -138,6 +153,9 @@ export default function App() {
       setFilter('all')
       setPlanPreview(null)
       setPlanFileName('')
+      // 主轨整体替换后，旧次轨不再对应当前校准结果，一并清除
+      setSecondary(null)
+      setSecondaryName('')
       // 保留已载入的视频，但重置播放位置
       const video = videoRef.current
       if (video) {
@@ -276,6 +294,82 @@ export default function App() {
     flash({ level: 'info', text: '已导出校准后的 SRT 文件（序号与文本保持不变）。' })
   }, [cues, lines, fileName, hasErrors, errorCount, flash])
 
+  /** 载入第二份（次轨）SRT 内容：按其时间与校准后的主时间轴匹配。 */
+  const applySecondary = useCallback(
+    (content: string, name: string) => {
+      const { cues: parsed, skipped } = parseSrt(content)
+      if (parsed.length === 0) {
+        flash({ level: 'error', text: '未能从第二份文件中解析出任何有效的 SRT 字幕。' })
+        return
+      }
+      setSecondary(parsed)
+      setSecondaryName(name)
+      flash({
+        level: 'info',
+        text:
+          `已导入次轨 ${parsed.length} 条字幕，已按校准后的主时间轴完成顺序匹配预览。` +
+          (skipped > 0 ? `（${skipped} 个无法解析的块已跳过）` : ''),
+      })
+    },
+    [flash],
+  )
+
+  /** 导入第二份（次轨）SRT 文件。 */
+  const loadSecondary = useCallback(
+    (file: File) => {
+      if (!cues) {
+        flash({ level: 'error', text: '请先导入主 SRT 并完成校准，再导入第二份 SRT。' })
+        return
+      }
+      const reader = new FileReader()
+      reader.onload = () => applySecondary(String(reader.result ?? ''), file.name)
+      reader.onerror = () => flash({ level: 'error', text: '读取第二份文件失败。' })
+      reader.readAsText(file)
+    },
+    [cues, flash, applySecondary],
+  )
+
+  const loadSampleSecondary = useCallback(() => {
+    if (!cues) {
+      flash({ level: 'error', text: '请先导入主 SRT（可先“载入示例”），再载入示例次轨。' })
+      return
+    }
+    applySecondary(SAMPLE_SECONDARY_SRT, '示例次轨（英文）.srt')
+  }, [cues, flash, applySecondary])
+
+  const unloadSecondary = useCallback(() => {
+    setSecondary(null)
+    setSecondaryName('')
+    flash({ level: 'info', text: '已卸载次轨 SRT，主轨未做任何改动。' })
+  }, [flash])
+
+  /** 导出双语 SRT：主轨有任何校验错误时禁止；未匹配次轨仅提示，不写入文件。 */
+  const exportMergedSrt = useCallback(() => {
+    if (!secondary || !mergeResult) return
+    if (hasErrors) {
+      flash({ level: 'error', text: `主轨仍有 ${errorCount} 条字幕存在错误，解决后才能合并导出。` })
+      return
+    }
+    const payload = buildMergedSrt(lines, secondary, mergeResult)
+    const blob = new Blob([payload], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const base = fileName.replace(/\.srt$/i, '') || 'subtitles'
+    a.href = url
+    a.download = `${base}.bilingual.srt`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    flash({
+      level: 'info',
+      text:
+        `已导出双语 SRT（${mergeResult.pairs.length} 对合并；` +
+        `${mergeResult.unmatchedMain.length} 条主轨单独导出；` +
+        `${mergeResult.unmatchedSecondary.length} 条次轨未匹配、未写入）。`,
+    })
+  }, [secondary, mergeResult, hasErrors, errorCount, lines, fileName, flash])
+
   const downloadFile = useCallback((content: string, downloadName: string, mime: string) => {
     const blob = new Blob([content], { type: mime })
     const url = URL.createObjectURL(blob)
@@ -386,7 +480,7 @@ export default function App() {
     >
       <header className="app-header">
         <h1>SRT 字幕时间轴校准工具</h1>
-        <p className="subtitle">本地运行 · 分段线性锚点校准 · 本地视频同步预览 · 校验通过后导出</p>
+        <p className="subtitle">本地运行 · 分段线性锚点校准 · 本地视频同步预览 · 双语字幕合并 · 校验通过后导出</p>
       </header>
 
       <section className="toolbar">
@@ -544,6 +638,18 @@ export default function App() {
               ⚠ 存在 {errorCount} 条问题字幕（负时间 / 重叠 / 非正时长），错误未解决前禁止导出。
             </div>
           )}
+          <BilingualMerge
+            lines={lines}
+            secondary={secondary}
+            secondaryName={secondaryName}
+            result={mergeResult}
+            hasErrors={hasErrors}
+            errorCount={errorCount}
+            onImportSecondary={loadSecondary}
+            onLoadSampleSecondary={loadSampleSecondary}
+            onUnloadSecondary={unloadSecondary}
+            onExportMerged={exportMergedSrt}
+          />
         </>
       )}
 
